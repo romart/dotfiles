@@ -12,6 +12,8 @@ vim.opt.ignorecase = true
 vim.opt.cursorline = true
 vim.opt.clipboard = 'unnamedplus'
 
+vim.o.autoread = true
+
 vim.opt.guicursor = "n-v-c:block-blinkon1-CursorInsert,i:block-CursorInsert"
 
 vim.opt.shell = os.getenv('SHELL')
