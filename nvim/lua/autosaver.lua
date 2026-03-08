@@ -1,8 +1,32 @@
-
-
 local utils = require('utils')
+local uv = vim.uv or vim.loop
+
 local autosave_enabled = true
 local force_tsr = false
+local autosave_in_progress = false
+local autosave_timer -- uv timer handle
+local buf_mtime_ns = {}
+
+local function notify_err(msg)
+  vim.schedule(function()
+    vim.notify(msg, vim.log.levels.ERROR)
+  end)
+end
+
+local function get_mtime_ns(path)
+  local st = uv.fs_stat(path)
+  if not st or not st.mtime then return nil end
+  local sec = st.mtime.sec or st.mtime.tv_sec
+  local nsec = st.mtime.nsec or st.mtime.tv_nsec or 0
+  if not sec then return nil end
+  return sec * 1e9 + nsec
+end
+
+local function update_buf_mtime(buf)
+  local name = vim.api.nvim_buf_get_name(buf)
+  if name == "" then return end
+  buf_mtime_ns[buf] = get_mtime_ns(name)
+end
 
 local toggle_autosave = function()
   autosave_enabled = not autosave_enabled
@@ -24,34 +48,85 @@ local trailings_cleaner = function()
 end
 
 local autosave = function()
-  if autosave_enabled then
-    if utils.is_git_commit() then
-      -- do not auto-save in git commit
-      return
-    end
-    if force_tsr then
-      trailings_cleaner();
-    end
-    if vim.bo.modified and vim.bo.modifiable and vim.bo.buftype == "" and vim.fn.expand("%") ~= "" then
-      local win = vim.api.nvim_get_current_win()
-      local buf = vim.api.nvim_get_current_buf()
-      local pos = vim.api.nvim_win_get_cursor(win) -- Save cursor
+  if not autosave_enabled then return end
+  if autosave_in_progress then return end
+  if utils.is_git_commit() then return end
 
-      vim.cmd("silent write")
-      vim.schedule(function()
-        -- due to 'write' command is async so we need to make sure cursor restoration
-        -- happens after write
-        if vim.api.nvim_get_current_buf() == buf and vim.api.nvim_get_current_win() == win then
-          vim.api.nvim_win_set_cursor(win, pos)
-        end
-      end)
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_get_current_buf()
+  local bufObj = vim.bo[buf];
+
+  if not (bufObj.modified and bufObj.modifiable and bufObj.buftype == "") then
+    return
+  end
+
+  local path = vim.api.nvim_buf_get_name(buf)
+  if path == "" then return end
+
+  -- Avoid clobbering external edits (Codex, git checkout, formatters, etc.)
+  local disk_mtime = get_mtime_ns(path)
+  local known_mtime = buf_mtime_ns[buf]
+  if known_mtime and disk_mtime and disk_mtime > known_mtime then
+    return
+  end
+
+  autosave_in_progress = true
+
+  -- Always release the "lock", no matter what happens.
+  local function release()
+    autosave_in_progress = false
+  end
+
+  local ok, err = pcall(function()
+    local pos = vim.api.nvim_win_get_cursor(win)
+
+    if force_tsr then
+      local ok_tsr, err_tsr = pcall(trailings_cleaner)
+      if not ok_tsr then
+        notify_err("Autosave: trailing-space cleaner failed:\n" .. tostring(err_tsr))
+        -- continue; a failure here shouldn't block saving
+      end
     end
+
+    local ok_upd, err_upd = pcall(vim.cmd, "silent update")
+    if not ok_upd then
+      notify_err("Autosave: write failed:\n" .. tostring(err_upd))
+      -- still continue to cursor restore + mtime update attempt below
+    end
+
+    vim.schedule(function()
+      -- Cursor restore only if still same win/buf
+      if vim.api.nvim_get_current_buf() == buf and vim.api.nvim_get_current_win() == win then
+        local ok_cur, err_cur = pcall(vim.api.nvim_win_set_cursor, win, pos)
+        if not ok_cur then
+          notify_err("Autosave: cursor restore failed:\n" .. tostring(err_cur))
+        end
+      end
+
+      update_buf_mtime(buf)
+      release()
+    end)
+  end)
+
+  if not ok then
+    -- Something unexpected exploded before the scheduled cleanup ran.
+    notify_err("Autosave: unexpected error:\n" .. tostring(err))
+    release()
   end
 end
 
-vim.api.nvim_create_autocmd({ "BufLeave", "FocusLost", "InsertLeave" }, {
+-- Autosave triggers
+vim.api.nvim_create_autocmd({ "BufLeave", "InsertLeave" }, {
   pattern = "*",
   callback = autosave,
+})
+
+-- Reload externally changed files when coming back (Codex edits etc.)
+vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter" }, {
+  pattern = "*",
+  callback = function()
+    pcall(vim.cmd, "checktime")
+  end,
 })
 
 vim.api.nvim_create_autocmd("BufWritePre", {
@@ -64,14 +139,24 @@ vim.api.nvim_create_user_command("ToggleAutosave", toggle_autosave, {})
 local min_autosave_interval = 1 -- 1 sec
 local autosave_interval = 30 -- 30 secs
 
-local function autosave_loop()
-  vim.defer_fn(function()
-    autosave()
-    autosave_loop()
-  end, autosave_interval * 1000)
+local function start_autosave_timer()
+  if autosave_timer then
+    autosave_timer:stop()
+    autosave_timer:close()
+    autosave_timer = nil
+  end
+
+  autosave_timer = uv.new_timer()
+  autosave_timer:start(
+    autosave_interval * 1000,
+    autosave_interval * 1000,
+    vim.schedule_wrap(function()
+      autosave()
+    end)
+  )
 end
 
-autosave_loop()
+start_autosave_timer()
 
 vim.api.nvim_create_user_command("SetAutoSaveInterval", function(opts)
   local number = tonumber(opts.args)
@@ -80,13 +165,9 @@ vim.api.nvim_create_user_command("SetAutoSaveInterval", function(opts)
     return
   end
 
-  number = math.max(number, min_autosave_interval);
-  -- Do something with the number
-  print("Change auto save interval from " .. autosave_interval .. " to " .. number .. " seconds")
+  number = math.max(number, min_autosave_interval)
+  print(("Change auto save interval from %s to %s seconds"):format(autosave_interval, number))
   autosave_interval = number
-  autosave_loop()
-end, {
-  nargs = 1,       -- Require exactly one argument
-  complete = nil,  -- No completion needed
-})
+  start_autosave_timer()
+end, { nargs = 1 })
 
